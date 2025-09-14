@@ -10,18 +10,20 @@ public class PlayerController : MonoBehaviour
     [Header("Movement Settings")]
     [Tooltip("How smoothly the basket follows the input. Lower values are faster and more responsive.")]
     public float smoothTime = 0.05f;
+    [Tooltip("The speed of the player when using keyboard controls.")]
+    public float keyboardSpeed = 10f;
 
     [Header("Boundaries")]
-    [Tooltip("The minimum X position the player can move to.")]
-    public float minX = -8f;
-    [Tooltip("The maximum X position the player can move to.")]
-    public float maxX = 8f;
+    [Tooltip("Padding from the screen edges in world units.")]
+    public float padding = 1f;
 
     // --- Private Fields ---
     private Rigidbody rb;
     private Vector3 targetPosition;
     private Vector3 velocity = Vector3.zero;
     private Camera mainCamera;
+    private float minX;
+    private float maxX;
 
     /// <summary>
     /// Called when the script instance is being loaded.
@@ -33,9 +35,29 @@ public class PlayerController : MonoBehaviour
         rb = GetComponent<Rigidbody>();
         mainCamera = Camera.main;
 
+        // Calculate screen boundaries based on camera view
+        SetupBoundaries();
+
         // Initialize target position to the player's starting position
         // This prevents the player from snapping to a default position on game start
         targetPosition = rb.position;
+    }
+
+    /// <summary>
+    /// Calculates the movement boundaries based on the screen size and camera view.
+    /// </summary>
+    private void SetupBoundaries()
+    {
+        // Calculate the distance from the camera to the object.
+        float distance = transform.position.z - mainCamera.transform.position.z;
+
+        // Get the world coordinates for the left and right edges of the viewport at the calculated distance.
+        Vector3 leftBoundary = mainCamera.ViewportToWorldPoint(new Vector3(0, 0.5f, distance));
+        Vector3 rightBoundary = mainCamera.ViewportToWorldPoint(new Vector3(1, 0.5f, distance));
+
+        // Apply padding to the boundaries.
+        minX = leftBoundary.x + padding;
+        maxX = rightBoundary.x - padding;
     }
 
     /// <summary>
@@ -50,6 +72,7 @@ public class PlayerController : MonoBehaviour
         // The UNITY_EDITOR directive ensures this code only runs in the Unity Editor
         #if UNITY_EDITOR
         HandleMouseInput();
+        HandleKeyboardInput();
         #endif
     }
 
@@ -79,6 +102,22 @@ public class PlayerController : MonoBehaviour
         if (Input.GetMouseButton(0))
         {
             UpdateTargetPosition(Input.mousePosition);
+        }
+    }
+
+    /// <summary>
+    /// Checks for and processes keyboard input for testing purposes.
+    /// </summary>
+    private void HandleKeyboardInput()
+    {
+        if (Input.GetKey(KeyCode.LeftArrow))
+        {
+            targetPosition.x -= keyboardSpeed * Time.deltaTime;
+        }
+
+        if (Input.GetKey(KeyCode.RightArrow))
+        {
+            targetPosition.x += keyboardSpeed * Time.deltaTime;
         }
     }
 
