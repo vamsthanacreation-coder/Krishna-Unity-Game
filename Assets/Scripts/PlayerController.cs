@@ -1,8 +1,10 @@
 using UnityEngine;
+using System.Collections.Generic;
 
 /// <summary>
-/// Manages the player's basket movement based on mouse or touch input.
-/// The basket is restricted to horizontal movement within defined boundaries.
+/// Enhanced PlayerController with improved mobile touch controls.
+/// Features multi-touch support, gesture recognition, and smooth responsive movement.
+/// The player can move in all 4 directions (up, down, left, right) within defined boundaries.
 /// </summary>
 [RequireComponent(typeof(Rigidbody))]
 public class PlayerController : MonoBehaviour
@@ -12,18 +14,59 @@ public class PlayerController : MonoBehaviour
     public float smoothTime = 0.05f;
     [Tooltip("The speed of the player when using keyboard controls.")]
     public float keyboardSpeed = 10f;
+    [Tooltip("Maximum speed the player can move.")]
+    public float maxSpeed = 15f;
 
     [Header("Boundaries")]
-    [Tooltip("Padding from the screen edges in world units.")]
-    public float padding = 1f;
+    [Tooltip("Horizontal padding from the screen edges in world units.")]
+    public float horizontalPadding = 1f;
+    [Tooltip("Vertical padding from the screen edges in world units.")]
+    public float verticalPadding = 1f;
+    [Tooltip("Enable movement boundaries. If false, player can move freely.")]
+    public bool enableBoundaries = true;
+    
+    [Header("Touch Controls")]
+    [Tooltip("Minimum distance a touch must move to be considered intentional (in pixels).")]
+    public float touchDeadZone = 10f;
+    [Tooltip("How sensitive the touch controls are. Higher values = more sensitive.")]
+    public float touchSensitivity = 1.2f;
+    [Tooltip("Enable haptic feedback on touch (requires mobile device).")]
+    public bool enableHapticFeedback = true;
+    [Tooltip("Minimum time between haptic feedback pulses (in seconds).")]
+    public float hapticCooldown = 0.1f;
+    [Tooltip("Enable swipe gesture controls for movement.")]
+    public bool enableSwipeGestures = true;
+    [Tooltip("Minimum swipe distance to trigger movement (in pixels).")]
+    public float minSwipeDistance = 50f;
+    [Tooltip("Speed multiplier for horizontal swipe-based movement.")]
+    public float horizontalSwipeSpeedMultiplier = 2f;
+    [Tooltip("Speed multiplier for vertical swipe-based movement.")]
+    public float verticalSwipeSpeedMultiplier = 2f;
 
     // --- Private Fields ---
     private Rigidbody rb;
     private Vector3 targetPosition;
     private Vector3 velocity = Vector3.zero;
     private Camera mainCamera;
-    private float minX;
-    private float maxX;
+    private float minX, maxX;
+    private float minY, maxY;
+    
+    // Touch tracking
+    private Dictionary<int, TouchData> activeTouches = new Dictionary<int, TouchData>();
+    private Vector2 primaryTouchStart;
+    private bool hasPrimaryTouch = false;
+    private float lastHapticTime;
+    private Vector2 swipeAccumulation = Vector2.zero;
+    
+    // Touch data structure
+    private struct TouchData
+    {
+        public Vector2 startPosition;
+        public Vector2 currentPosition;
+        public Vector2 lastPosition;
+        public float startTime;
+        public bool isMoving;
+    }
 
     /// <summary>
     /// Called when the script instance is being loaded.
@@ -44,20 +87,26 @@ public class PlayerController : MonoBehaviour
     }
 
     /// <summary>
-    /// Calculates the movement boundaries based on the screen size and camera view.
+    /// Calculates the movement boundaries based on the screen size and camera view for 4-directional movement.
     /// </summary>
     private void SetupBoundaries()
     {
+        if (!enableBoundaries) return;
+        
         // Calculate the distance from the camera to the object.
-        float distance = transform.position.z - mainCamera.transform.position.z;
+        float distance = Mathf.Abs(transform.position.z - mainCamera.transform.position.z);
 
-        // Get the world coordinates for the left and right edges of the viewport at the calculated distance.
+        // Get the world coordinates for all edges of the viewport at the player's Z position.
         Vector3 leftBoundary = mainCamera.ViewportToWorldPoint(new Vector3(0, 0.5f, distance));
         Vector3 rightBoundary = mainCamera.ViewportToWorldPoint(new Vector3(1, 0.5f, distance));
+        Vector3 bottomBoundary = mainCamera.ViewportToWorldPoint(new Vector3(0.5f, 0, distance));
+        Vector3 topBoundary = mainCamera.ViewportToWorldPoint(new Vector3(0.5f, 1, distance));
 
-        // Apply padding to the boundaries.
-        minX = leftBoundary.x + padding;
-        maxX = rightBoundary.x - padding;
+        // Apply padding to all boundaries.
+        minX = leftBoundary.x + horizontalPadding;
+        maxX = rightBoundary.x - horizontalPadding;
+        minY = bottomBoundary.y + verticalPadding;
+        maxY = topBoundary.y - verticalPadding;
     }
 
     /// <summary>
@@ -77,20 +126,263 @@ public class PlayerController : MonoBehaviour
     }
 
     /// <summary>
-    /// Checks for and processes touch input.
+    /// Enhanced touch input handling with multi-touch support and gesture recognition.
     /// </summary>
     private void HandleTouchInput()
     {
-        if (Input.touchCount > 0)
+        // Process all active touches
+        for (int i = 0; i < Input.touchCount; i++)
         {
-            Touch touch = Input.GetTouch(0);
-
-            // When the finger is on the screen (began or moved)
-            if (touch.phase == TouchPhase.Began || touch.phase == TouchPhase.Moved)
+            Touch touch = Input.GetTouch(i);
+            ProcessTouch(touch);
+        }
+        
+        // Clean up ended touches
+        CleanupEndedTouches();
+        
+        // Handle swipe gestures if enabled
+        if (enableSwipeGestures)
+        {
+            ProcessSwipeGestures();
+        }
+    }
+    
+    /// <summary>
+    /// Processes individual touch input with enhanced phase handling.
+    /// </summary>
+    /// <param name="touch">The touch to process</param>
+    private void ProcessTouch(Touch touch)
+    {
+        switch (touch.phase)
+        {
+            case TouchPhase.Began:
+                OnTouchBegan(touch);
+                break;
+                
+            case TouchPhase.Moved:
+                OnTouchMoved(touch);
+                break;
+                
+            case TouchPhase.Stationary:
+                OnTouchStationary(touch);
+                break;
+                
+            case TouchPhase.Ended:
+            case TouchPhase.Canceled:
+                OnTouchEnded(touch);
+                break;
+        }
+    }
+    
+    /// <summary>
+    /// Handles the beginning of a touch.
+    /// </summary>
+    /// <param name="touch">The touch that began</param>
+    private void OnTouchBegan(Touch touch)
+    {
+        TouchData touchData = new TouchData
+        {
+            startPosition = touch.position,
+            currentPosition = touch.position,
+            lastPosition = touch.position,
+            startTime = Time.time,
+            isMoving = false
+        };
+        
+        activeTouches[touch.fingerId] = touchData;
+        
+        // Set primary touch (first touch or closest to center)
+        if (!hasPrimaryTouch || IsBetterPrimaryTouch(touch.position))
+        {
+            primaryTouchStart = touch.position;
+            hasPrimaryTouch = true;
+            
+            // Provide haptic feedback
+            if (enableHapticFeedback && Time.time - lastHapticTime > hapticCooldown)
+            {
+                ProvideTouchFeedback();
+                lastHapticTime = Time.time;
+            }
+            
+            // Update target position immediately for responsive feel
+            UpdateTargetPosition(touch.position);
+        }
+    }
+    
+    /// <summary>
+    /// Handles touch movement.
+    /// </summary>
+    /// <param name="touch">The moving touch</param>
+    private void OnTouchMoved(Touch touch)
+    {
+        if (activeTouches.ContainsKey(touch.fingerId))
+        {
+            TouchData touchData = activeTouches[touch.fingerId];
+            touchData.lastPosition = touchData.currentPosition;
+            touchData.currentPosition = touch.position;
+            
+            // Check if touch moved beyond dead zone
+            float moveDistance = Vector2.Distance(touchData.startPosition, touch.position);
+            if (moveDistance > touchDeadZone)
+            {
+                touchData.isMoving = true;
+            }
+            
+            activeTouches[touch.fingerId] = touchData;
+            
+            // Update position if this is the primary touch and it's moving
+            if (hasPrimaryTouch && touchData.isMoving)
+            {
+                UpdateTargetPositionWithSensitivity(touch.position);
+            }
+        }
+    }
+    
+    /// <summary>
+    /// Handles stationary touch (touch held in place).
+    /// </summary>
+    /// <param name="touch">The stationary touch</param>
+    private void OnTouchStationary(Touch touch)
+    {
+        // Keep updating position for stationary touches to maintain smooth following
+        if (hasPrimaryTouch && activeTouches.ContainsKey(touch.fingerId))
+        {
+            TouchData touchData = activeTouches[touch.fingerId];
+            if (touchData.isMoving)
             {
                 UpdateTargetPosition(touch.position);
             }
         }
+    }
+    
+    /// <summary>
+    /// Handles the end of a touch.
+    /// </summary>
+    /// <param name="touch">The ended touch</param>
+    private void OnTouchEnded(Touch touch)
+    {
+        if (activeTouches.ContainsKey(touch.fingerId))
+        {
+            // If this was the primary touch, find a new primary touch
+            if (hasPrimaryTouch)
+            {
+                hasPrimaryTouch = false;
+                swipeAccumulation = Vector2.zero;
+                
+                // Find another active touch to become primary
+                foreach (var kvp in activeTouches)
+                {
+                    if (kvp.Key != touch.fingerId)
+                    {
+                        primaryTouchStart = kvp.Value.currentPosition;
+                        hasPrimaryTouch = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    /// <summary>
+    /// Cleans up touches that have ended.
+    /// </summary>
+    private void CleanupEndedTouches()
+    {
+        List<int> touchesToRemove = new List<int>();
+        
+        foreach (var touchId in activeTouches.Keys)
+        {
+            bool touchStillActive = false;
+            for (int i = 0; i < Input.touchCount; i++)
+            {
+                if (Input.GetTouch(i).fingerId == touchId)
+                {
+                    touchStillActive = true;
+                    break;
+                }
+            }
+            
+            if (!touchStillActive)
+            {
+                touchesToRemove.Add(touchId);
+            }
+        }
+        
+        foreach (int touchId in touchesToRemove)
+        {
+            activeTouches.Remove(touchId);
+        }
+    }
+    
+    /// <summary>
+    /// Processes swipe gestures for 4-directional movement.
+    /// </summary>
+    private void ProcessSwipeGestures()
+    {
+        if (!hasPrimaryTouch) return;
+        
+        foreach (var touchData in activeTouches.Values)
+        {
+            if (touchData.isMoving)
+            {
+                Vector2 swipeDelta = touchData.currentPosition - touchData.lastPosition;
+                
+                // Accumulate both horizontal and vertical swipe for smoother movement
+                swipeAccumulation.x += swipeDelta.x * horizontalSwipeSpeedMultiplier * Time.deltaTime;
+                swipeAccumulation.y += swipeDelta.y * verticalSwipeSpeedMultiplier * Time.deltaTime;
+                
+                // Apply accumulated horizontal swipe movement
+                if (Mathf.Abs(swipeAccumulation.x) > 1f)
+                {
+                    Vector3 worldDeltaX = mainCamera.ScreenToWorldPoint(new Vector3(swipeAccumulation.x, 0, Mathf.Abs(transform.position.z - mainCamera.transform.position.z))) - 
+                                          mainCamera.ScreenToWorldPoint(new Vector3(0, 0, Mathf.Abs(transform.position.z - mainCamera.transform.position.z)));
+                    
+                    targetPosition.x += worldDeltaX.x;
+                    swipeAccumulation.x = 0f;
+                }
+                
+                // Apply accumulated vertical swipe movement (note: Y is inverted for screen coordinates)
+                if (Mathf.Abs(swipeAccumulation.y) > 1f)
+                {
+                    Vector3 worldDeltaY = mainCamera.ScreenToWorldPoint(new Vector3(0, swipeAccumulation.y, Mathf.Abs(transform.position.z - mainCamera.transform.position.z))) - 
+                                          mainCamera.ScreenToWorldPoint(new Vector3(0, 0, Mathf.Abs(transform.position.z - mainCamera.transform.position.z)));
+                    
+                    // Invert Y movement to match screen coordinate system
+                    targetPosition.y -= worldDeltaY.y;
+                    swipeAccumulation.y = 0f;
+                }
+                
+                break; // Only process primary touch for swipes
+            }
+        }
+    }
+    
+    /// <summary>
+    /// Determines if a touch position would be a better primary touch.
+    /// </summary>
+    /// <param name="touchPosition">Position to evaluate</param>
+    /// <returns>True if this would be a better primary touch</returns>
+    private bool IsBetterPrimaryTouch(Vector2 touchPosition)
+    {
+        // Prefer touches closer to the center of the screen horizontally
+        float screenCenterX = Screen.width * 0.5f;
+        float currentDistance = Mathf.Abs(primaryTouchStart.x - screenCenterX);
+        float newDistance = Mathf.Abs(touchPosition.x - screenCenterX);
+        
+        return newDistance < currentDistance;
+    }
+    
+    /// <summary>
+    /// Provides haptic feedback for touch interactions.
+    /// </summary>
+    private void ProvideTouchFeedback()
+    {
+        #if UNITY_ANDROID || UNITY_IOS
+        if (SystemInfo.supportsVibration)
+        {
+            Handheld.Vibrate();
+        }
+        #endif
     }
 
     /// <summary>
@@ -106,56 +398,84 @@ public class PlayerController : MonoBehaviour
     }
 
     /// <summary>
-    /// Checks for and processes keyboard input for testing purposes.
+    /// Checks for and processes keyboard input for testing purposes (4-directional movement).
     /// </summary>
     private void HandleKeyboardInput()
     {
-        if (Input.GetKey(KeyCode.LeftArrow))
+        // Horizontal movement
+        if (Input.GetKey(KeyCode.LeftArrow) || Input.GetKey(KeyCode.A))
         {
             targetPosition.x -= keyboardSpeed * Time.deltaTime;
         }
 
-        if (Input.GetKey(KeyCode.RightArrow))
+        if (Input.GetKey(KeyCode.RightArrow) || Input.GetKey(KeyCode.D))
         {
             targetPosition.x += keyboardSpeed * Time.deltaTime;
+        }
+        
+        // Vertical movement
+        if (Input.GetKey(KeyCode.UpArrow) || Input.GetKey(KeyCode.W))
+        {
+            targetPosition.y += keyboardSpeed * Time.deltaTime;
+        }
+        
+        if (Input.GetKey(KeyCode.DownArrow) || Input.GetKey(KeyCode.S))
+        {
+            targetPosition.y -= keyboardSpeed * Time.deltaTime;
         }
     }
 
     /// <summary>
     /// Converts a screen position (from touch or mouse) to a world position
-    /// and updates the horizontal target position for the basket.
+    /// and updates the target position for 4-directional movement.
     /// </summary>
     /// <param name="screenPosition">The position on the screen (in pixels).</param>
     private void UpdateTargetPosition(Vector2 screenPosition)
     {
-        // Create a ray from the camera to the screen position
-        Ray ray = mainCamera.ScreenPointToRay(screenPosition);
+        // Convert screen position to world position at the player's Z depth
+        Vector3 worldPosition = mainCamera.ScreenToWorldPoint(new Vector3(screenPosition.x, screenPosition.y, Mathf.Abs(transform.position.z - mainCamera.transform.position.z)));
 
-        // We need a plane to determine the world position at the player's depth.
-        // This plane is horizontal (normal is Vector3.up) and is at the player's current Y level.
-        Plane gamePlane = new Plane(Vector3.up, new Vector3(0, rb.position.y, 0));
-
-        // Check if the ray intersects with our game plane
-        if (gamePlane.Raycast(ray, out float distance))
-        {
-            // Get the point where the ray intersects the plane
-            Vector3 worldPosition = ray.GetPoint(distance);
-
-            // Update the target position, but only on the horizontal (X) axis,
-            // as the basket's movement is restricted to left and right.
-            targetPosition.x = worldPosition.x;
-        }
+        // Update the target position on both X and Y axes for 4-directional movement
+        targetPosition.x = worldPosition.x;
+        targetPosition.y = worldPosition.y;
+    }
+    
+    /// <summary>
+    /// Updates target position with touch sensitivity applied for enhanced 4-directional control.
+    /// </summary>
+    /// <param name="screenPosition">The position on the screen (in pixels).</param>
+    private void UpdateTargetPositionWithSensitivity(Vector2 screenPosition)
+    {
+        // Convert screen position to world position at the player's Z depth
+        Vector3 worldPosition = mainCamera.ScreenToWorldPoint(new Vector3(screenPosition.x, screenPosition.y, Mathf.Abs(transform.position.z - mainCamera.transform.position.z)));
+        
+        // Apply touch sensitivity for more responsive control on both axes
+        float deltaX = (worldPosition.x - targetPosition.x) * touchSensitivity;
+        float deltaY = (worldPosition.y - targetPosition.y) * touchSensitivity;
+        
+        // Clamp the deltas to prevent overly sensitive movement
+        float maxDelta = maxSpeed * Time.deltaTime;
+        deltaX = Mathf.Clamp(deltaX, -maxDelta, maxDelta);
+        deltaY = Mathf.Clamp(deltaY, -maxDelta, maxDelta);
+        
+        // Update the target position with sensitivity applied on both axes
+        targetPosition.x += deltaX;
+        targetPosition.y += deltaY;
     }
 
     /// <summary>
-    /// Called at a fixed interval. Used for physics-based movement.
+    /// Called at a fixed interval. Used for physics-based 4-directional movement.
     /// </summary>
     void FixedUpdate() {
-        // Clamp the target's X position to stay within the defined boundaries
-        targetPosition.x = Mathf.Clamp(targetPosition.x, minX, maxX);
+        // Clamp the target position to stay within the defined boundaries (if enabled)
+        if (enableBoundaries)
+        {
+            targetPosition.x = Mathf.Clamp(targetPosition.x, minX, maxX);
+            targetPosition.y = Mathf.Clamp(targetPosition.y, minY, maxY);
+        }
 
         // Smoothly move the Rigidbody's position towards the clamped target position.
-        // This creates a fluid, non-jittery movement.
+        // This creates a fluid, non-jittery movement in all directions.
         Vector3 newPosition = Vector3.SmoothDamp(rb.position, targetPosition, ref velocity, smoothTime);
         
         // Apply the new position to the Rigidbody
