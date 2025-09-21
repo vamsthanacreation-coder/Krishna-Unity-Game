@@ -54,6 +54,7 @@ public class PlayerController : MonoBehaviour
     // Touch tracking
     private Dictionary<int, TouchData> activeTouches = new Dictionary<int, TouchData>();
     private Vector2 primaryTouchStart;
+    private int primaryTouchId = -1;
     private bool hasPrimaryTouch = false;
     private float lastHapticTime;
     private Vector2 swipeAccumulation = Vector2.zero;
@@ -78,6 +79,13 @@ public class PlayerController : MonoBehaviour
         rb = GetComponent<Rigidbody>();
         mainCamera = Camera.main;
 
+        // Null check for main camera
+        if (mainCamera == null)
+        {
+            Debug.LogError("PlayerController: No main camera found! Please tag a camera as 'MainCamera'.");
+            return;
+        }
+
         // Calculate screen boundaries based on camera view
         SetupBoundaries();
 
@@ -91,7 +99,7 @@ public class PlayerController : MonoBehaviour
     /// </summary>
     private void SetupBoundaries()
     {
-        if (!enableBoundaries) return;
+        if (!enableBoundaries || mainCamera == null) return;
         
         // Calculate the distance from the camera to the object.
         float distance = Mathf.Abs(transform.position.z - mainCamera.transform.position.z);
@@ -107,6 +115,23 @@ public class PlayerController : MonoBehaviour
         maxX = rightBoundary.x - horizontalPadding;
         minY = bottomBoundary.y + verticalPadding;
         maxY = topBoundary.y - verticalPadding;
+
+        // Ensure boundaries are valid (min < max)
+        if (minX >= maxX)
+        {
+            Debug.LogWarning("PlayerController: Horizontal boundaries are invalid. Reducing horizontal padding.");
+            float centerX = (leftBoundary.x + rightBoundary.x) * 0.5f;
+            minX = centerX - 0.1f;
+            maxX = centerX + 0.1f;
+        }
+        
+        if (minY >= maxY)
+        {
+            Debug.LogWarning("PlayerController: Vertical boundaries are invalid. Reducing vertical padding.");
+            float centerY = (bottomBoundary.y + topBoundary.y) * 0.5f;
+            minY = centerY - 0.1f;
+            maxY = centerY + 0.1f;
+        }
     }
 
     /// <summary>
@@ -130,6 +155,9 @@ public class PlayerController : MonoBehaviour
     /// </summary>
     private void HandleTouchInput()
     {
+        // Early exit if camera is null
+        if (mainCamera == null) return;
+        
         // Process all active touches
         for (int i = 0; i < Input.touchCount; i++)
         {
@@ -195,6 +223,7 @@ public class PlayerController : MonoBehaviour
         if (!hasPrimaryTouch || IsBetterPrimaryTouch(touch.position))
         {
             primaryTouchStart = touch.position;
+            primaryTouchId = touch.fingerId;
             hasPrimaryTouch = true;
             
             // Provide haptic feedback
@@ -204,8 +233,8 @@ public class PlayerController : MonoBehaviour
                 lastHapticTime = Time.time;
             }
             
-            // Update target position immediately for responsive feel
-            UpdateTargetPosition(touch.position);
+            // Don't update target position immediately on touch begin
+            // Let the object stay where it is and only move when touch moves
         }
     }
     
@@ -231,9 +260,13 @@ public class PlayerController : MonoBehaviour
             activeTouches[touch.fingerId] = touchData;
             
             // Update position if this is the primary touch and it's moving
-            if (hasPrimaryTouch && touchData.isMoving)
+            if (hasPrimaryTouch && touchData.isMoving && touch.fingerId == primaryTouchId)
             {
-                UpdateTargetPositionWithSensitivity(touch.position);
+                // Calculate the movement delta in screen space
+                Vector2 deltaMovement = touch.position - touchData.lastPosition;
+                
+                // Convert delta to world space and apply to target position
+                UpdateTargetPositionWithDelta(deltaMovement);
             }
         }
     }
@@ -244,15 +277,9 @@ public class PlayerController : MonoBehaviour
     /// <param name="touch">The stationary touch</param>
     private void OnTouchStationary(Touch touch)
     {
-        // Keep updating position for stationary touches to maintain smooth following
-        if (hasPrimaryTouch && activeTouches.ContainsKey(touch.fingerId))
-        {
-            TouchData touchData = activeTouches[touch.fingerId];
-            if (touchData.isMoving)
-            {
-                UpdateTargetPosition(touch.position);
-            }
-        }
+        // For stationary touches, don't move the object
+        // The object should only move when the touch actually moves
+        // This prevents the object from jumping to the touch position when held
     }
     
     /// <summary>
@@ -264,9 +291,10 @@ public class PlayerController : MonoBehaviour
         if (activeTouches.ContainsKey(touch.fingerId))
         {
             // If this was the primary touch, find a new primary touch
-            if (hasPrimaryTouch)
+            if (hasPrimaryTouch && touch.fingerId == primaryTouchId)
             {
                 hasPrimaryTouch = false;
+                primaryTouchId = -1;
                 swipeAccumulation = Vector2.zero;
                 
                 // Find another active touch to become primary
@@ -275,6 +303,7 @@ public class PlayerController : MonoBehaviour
                     if (kvp.Key != touch.fingerId)
                     {
                         primaryTouchStart = kvp.Value.currentPosition;
+                        primaryTouchId = kvp.Key;
                         hasPrimaryTouch = true;
                         break;
                     }
@@ -391,9 +420,23 @@ public class PlayerController : MonoBehaviour
     private void HandleMouseInput()
     {
         // Use the left mouse button as a substitute for touch in the editor
-        if (Input.GetMouseButton(0))
+        if (Input.GetMouseButtonDown(0))
         {
-            UpdateTargetPosition(Input.mousePosition);
+            // Store the initial mouse position when first clicked
+            primaryTouchStart = Input.mousePosition;
+        }
+        else if (Input.GetMouseButton(0))
+        {
+            // Calculate mouse movement delta and apply relative movement
+            Vector2 currentMousePos = Input.mousePosition;
+            Vector2 deltaMovement = currentMousePos - primaryTouchStart;
+            
+            // Only move if there's significant movement (similar to touch dead zone)
+            if (deltaMovement.magnitude > touchDeadZone)
+            {
+                UpdateTargetPositionWithDelta(deltaMovement);
+                primaryTouchStart = currentMousePos; // Update for next frame
+            }
         }
     }
 
@@ -461,6 +504,31 @@ public class PlayerController : MonoBehaviour
         // Update the target position with sensitivity applied on both axes
         targetPosition.x += deltaX;
         targetPosition.y += deltaY;
+    }
+    
+    /// <summary>
+    /// Updates target position based on touch movement delta (relative movement).
+    /// </summary>
+    /// <param name="screenDelta">The movement delta in screen space (in pixels).</param>
+    private void UpdateTargetPositionWithDelta(Vector2 screenDelta)
+    {
+        // Convert screen delta to world delta at the player's Z depth
+        float distance = Mathf.Abs(transform.position.z - mainCamera.transform.position.z);
+        
+        Vector3 worldDelta = mainCamera.ScreenToWorldPoint(new Vector3(screenDelta.x, screenDelta.y, distance)) - 
+                            mainCamera.ScreenToWorldPoint(new Vector3(0, 0, distance));
+        
+        // Apply touch sensitivity for more responsive control
+        worldDelta *= touchSensitivity;
+        
+        // Clamp the deltas to prevent overly sensitive movement
+        float maxDelta = maxSpeed * Time.deltaTime;
+        worldDelta.x = Mathf.Clamp(worldDelta.x, -maxDelta, maxDelta);
+        worldDelta.y = Mathf.Clamp(worldDelta.y, -maxDelta, maxDelta);
+        
+        // Update the target position with the relative movement
+        targetPosition.x += worldDelta.x;
+        targetPosition.y += worldDelta.y;
     }
 
     /// <summary>
